@@ -5,13 +5,14 @@ library(tidyverse)
 SIGNATURE1 = as.raw(c(0xD4, 0xC3, 0xB2, 0xA1))  # timestamps are in usec
 SIGNATURE2 = as.raw(c(0x4D, 0x3C, 0xB2, 0xA1))  # timestamps are in nsec
 
-LINK_TYPE <- list()
-LINK_TYPE[[113]] <- "Linux SLL"
+L2_TYPE <- list()
+L2_TYPE[[113]] <- "Linux SLL"
 
-NETWORK_TYPE <- list()
-NETWORK_TYPE[[0x0800]] <- "IPv4"
+L3_TYPE <- list()
+L3_TYPE[[0x0800]] <- "IPv4"
+L3_TYPE[[0x0806]] <- "ARP"
 
-TRANSPORT_TYPE <- list()
+L4_TYPE <- list()
 
 
 # utils
@@ -111,8 +112,15 @@ read_pcap <- function(path){
 
     # tentative
     if(link_type == 0){
-        link_type <- 113  # to LINUX_SLL
+        link_type <- 113  # to Linux SLL
     }
+
+    tryCatch({
+        type <<- L2_TYPE[[link_type]]
+    },
+    error = function(e){
+        type <<- "unknown"
+    })
 
     no <- 1
     rows <- list()
@@ -133,18 +141,21 @@ read_pcap <- function(path){
             time = time,
             # cap_len = cap_len,
             # org_len = org_len,
-            link_type = LINK_TYPE[[link_type]],
             data = list(data)
         )
         no <- no + 1
     }
-    dfrm <- bind_rows(rows)
+    close(con)
+
+    dfrm <-
+        bind_rows(rows) %>%
+        mutate(parsed = map(data, parse_packet, type = type))
 
     return(list(header = header, dfrm = dfrm))
 }
 
 
-parse_any <- function(array, type, level = 1){
+parse_packet <- function(array, type, recursive = T, level = 1){
     if(type == "Linux SLL"){
         dfrm <- parse_linux_sll(array, level)
     }
@@ -152,8 +163,21 @@ parse_any <- function(array, type, level = 1){
         dfrm <- parse_ipv4(array, level)
     }
     else{
-        print(str_c("error: ", type, " not found"))
+        if(type != "none" && type != "unknown"){
+            print(str_c("error: parser for ", type, " was not found"))
+        }
         dfrm <- tibble()
+        recursive = F  # turn off recursion
+    }
+
+    if(recursive && length(dfrm$payload[[1]]) != 0){
+        residual <- parse_packet(
+            array = dfrm$payload[[1]],
+            type = dfrm$type_next[1],
+            recursive = T,
+            level = level + 1
+        )
+        dfrm <- bind_rows(dfrm, residual)
     }
 
     return(dfrm)
@@ -169,25 +193,23 @@ parse_linux_sll <- function(array, level = 1){
     payload <- as_byte_array(array, 16, -1)
 
     tryCatch({
-        type_next <<- NETWORK_TYPE[[network_type]]
+        type_next <<- L3_TYPE[[network_type]]
     },
     error = function(e){
-        type_next <<- "none"
+        type_next <<- "unknown"
     })
 
-    row <- tibble(
+    return(tibble(
         level = level,
         type = "Linux SLL",
-        data = list(tibble(
+        info = list(tibble(
             packet_type = packet_type,
-            address = address,
-            payload = list(payload)
+            address = address
         )),
-        type_next = type_next
-    )
-    residual <- parse_any(payload, type_next, level + 1)
-
-    return(bind_rows(row, residual))
+        type_next = type_next,
+        payload = list(payload),
+        raw = list(array)
+    ))
 }
 
 parse_ipv4 <- function(array, level = 1){
@@ -204,16 +226,16 @@ parse_ipv4 <- function(array, level = 1){
     payload <- as_byte_array(array, 20, -1)
 
     tryCatch({
-        type_next <<- TRANSPORT_TYPE[[protocol]]
+        type_next <<- L4_TYPE[[protocol]]
     },
     error = function(e){
-        type_next <<- "none"
+        type_next <<- "unknown"
     })
 
-    row <- tibble(
+    return(tibble(
         level = level,
         type = "IPv4",
-        data = list(tibble(
+        info = list(tibble(
             ToS = ToS,
             packet_length =packet_length,
             id = id,
@@ -222,12 +244,10 @@ parse_ipv4 <- function(array, level = 1){
             fragment_offset = fragment_offset,
             TTL = TTL,
             src_ip = src_ip,
-            dst_ip = dst_ip,
-            payload = list(payload)
+            dst_ip = dst_ip
         )),
-        type_next = type_next
-    )
-    residual <- parse_any(payload, type_next, level + 1)
-
-    return(bind_rows(row, residual))
+        type_next = type_next,
+        payload = list(payload),
+        raw = list(array)
+    ))
 }
